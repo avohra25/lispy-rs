@@ -56,11 +56,56 @@ fn not(a: &[Value]) -> Result<Value, String> {
     Ok(Value::Bool(!a.first().map(Value::truthy).unwrap_or(false)))
 }
 
+fn list(a: &[Value]) -> Result<Value, String> { Ok(Value::List(a.to_vec())) }
+
+fn as_list<'a>(name: &str, v: Option<&'a Value>) -> Result<&'a [Value], String> {
+    match v {
+        Some(Value::List(xs)) => Ok(xs),
+        other => Err(format!("{name}: expected list, got {}", other.map(|v| v.to_string()).unwrap_or_default())),
+    }
+}
+
+fn car(a: &[Value]) -> Result<Value, String> {
+    as_list("car", a.first())?.first().cloned().ok_or("car: empty list".into())
+}
+
+fn cdr(a: &[Value]) -> Result<Value, String> {
+    let xs = as_list("cdr", a.first())?;
+    if xs.is_empty() { return Err("cdr: empty list".into()); }
+    Ok(Value::List(xs[1..].to_vec()))
+}
+
+fn cons(a: &[Value]) -> Result<Value, String> {
+    let head = a.first().cloned().ok_or("cons: needs 2 arguments")?;
+    let mut out = vec![head];
+    out.extend_from_slice(as_list("cons", a.get(1))?);
+    Ok(Value::List(out))
+}
+
+fn is_null(a: &[Value]) -> Result<Value, String> {
+    Ok(Value::Bool(matches!(a.first(), Some(Value::List(xs)) if xs.is_empty())))
+}
+
+fn length(a: &[Value]) -> Result<Value, String> {
+    Ok(Value::Num(as_list("length", a.first())?.len() as f64))
+}
+
+fn display(a: &[Value]) -> Result<Value, String> {
+    let parts: Vec<String> = a.iter().map(|v| match v {
+        Value::Str(s) => s.clone(),
+        other => other.to_string(),
+    }).collect();
+    println!("{}", parts.join(" "));
+    Ok(Value::Bool(true))
+}
+
 pub fn install(env: &Env) {
     let table: &[(&'static str, crate::eval::Builtin)] = &[
         ("+", add), ("-", sub), ("*", mul), ("/", div),
         ("<", lt), (">", gt), ("<=", le), (">=", ge), ("=", num_eq),
         ("equal?", equal), ("not", not),
+        ("list", list), ("car", car), ("cdr", cdr), ("cons", cons),
+        ("null?", is_null), ("length", length), ("display", display),
     ];
     for (name, f) in table {
         env.define(name, Value::Builtin(name, *f));
