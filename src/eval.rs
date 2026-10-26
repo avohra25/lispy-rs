@@ -20,8 +20,44 @@ pub enum Value {
 
 pub struct Lambda {
     params: Vec<String>,
+    /// Name bound to a list of any extra arguments (`(a b . rest)` or `args`).
+    rest: Option<String>,
     body: Vec<Expr>,
     env: Env,
+}
+
+impl Lambda {
+    /// Bind `vals` to the parameters in a fresh scope under the closure's env.
+    fn bind(&self, vals: Vec<Value>) -> Result<Env, String> {
+        let n = self.params.len();
+        let ok = match self.rest { Some(_) => vals.len() >= n, None => vals.len() == n };
+        if !ok {
+            let want = if self.rest.is_some() { format!("at least {n}") } else { n.to_string() };
+            return Err(format!("expected {want} args, got {}", vals.len()));
+        }
+        let new = Env::new(Some(self.env.clone()));
+        let mut it = vals.into_iter();
+        for p in &self.params { new.define(p, it.next().unwrap()); }
+        if let Some(r) = &self.rest { new.define(r, Value::List(it.collect())); }
+        Ok(new)
+    }
+}
+
+/// Parse a parameter spec: `(a b)`, `(a b . rest)`, or a bare symbol `args`.
+fn params(form: &str, e: &Expr) -> Result<(Vec<String>, Option<String>), String> {
+    let ps = match e {
+        Expr::Sym(s) => return Ok((vec![], Some(s.clone()))),
+        Expr::List(ps) => ps,
+        other => return Err(format!("{form}: bad parameter list {other}")),
+    };
+    let names: Vec<String> = ps.iter().map(sym).collect::<Result<_, _>>()?;
+    match names.iter().position(|n| n == ".") {
+        None => Ok((names, None)),
+        Some(i) if i + 2 == names.len() && i > 0 || i == 0 && names.len() == 2 => {
+            Ok((names[..i].to_vec(), Some(names[i + 1].clone())))
+        }
+        Some(_) => Err(format!("{form}: '.' must be followed by exactly one rest parameter")),
+    }
 }
 
 impl fmt::Display for Value {
@@ -175,8 +211,8 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, String> {
                         // (define (f x y) body...) sugar
                         Expr::List(sig) if !sig.is_empty() => {
                             let name = sym(&sig[0])?;
-                            let params = sig[1..].iter().map(sym).collect::<Result<_, _>>()?;
-                            let l = Lambda { params, body: args[1..].to_vec(), env: env.clone() };
+                            let (params, rest) = params("define", &Expr::List(sig[1..].to_vec()))?;
+                            let l = Lambda { params, rest, body: args[1..].to_vec(), env: env.clone() };
                             env.define(&name, Value::Lambda(Rc::new(l)));
                         }
                         target => {
@@ -194,11 +230,8 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, String> {
                 }
                 "lambda" => {
                     arity("lambda", args, 2)?;
-                    let params = match &args[0] {
-                        Expr::List(ps) => ps.iter().map(sym).collect::<Result<_, _>>()?,
-                        other => return Err(format!("lambda: bad parameter list {other}")),
-                    };
-                    let l = Lambda { params, body: args[1..].to_vec(), env: env.clone() };
+                    let (params, rest) = params("lambda", &args[0])?;
+                    let l = Lambda { params, rest, body: args[1..].to_vec(), env: env.clone() };
                     return Ok(Value::Lambda(Rc::new(l)));
                 }
                 "let" if matches!(args.first(), Some(Expr::Sym(_))) => {
@@ -212,10 +245,9 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, String> {
                     for (_, init) in &pairs { vals.push(eval(init, &env)?); }
                     let scope = Env::new(Some(env.clone()));
                     let params = pairs.into_iter().map(|(k, _)| k).collect();
-                    let l = Rc::new(Lambda { params, body: args[2..].to_vec(), env: scope.clone() });
+                    let l = Rc::new(Lambda { params, rest: None, body: args[2..].to_vec(), env: scope.clone() });
                     scope.define(&name, Value::Lambda(l.clone()));
-                    let new = Env::new(Some(scope));
-                    for (p, v) in l.params.iter().zip(vals) { new.define(p, v); }
+                    let new = l.bind(vals)?;
                     expr = body_tail(&l.body, &new)?;
                     env = new;
                     continue;
@@ -286,18 +318,24 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, String> {
                 _ => {}
             }
         }
-        let f = eval(head, &env)?;
-        let vals = args.iter().map(|a| eval(a, &env)).collect::<Result<Vec<_>, _>>()?;
+        let mut f = eval(head, &env)?;
+        let mut vals = args.iter().map(|a| eval(a, &env)).collect::<Result<Vec<_>, _>>()?;
+        // `apply` is handled here rather than as a plain builtin so it can call
+        // closures, and so `(apply f xs)` in tail position stays a tail call.
+        while let Value::Builtin("apply", _) = f {
+            let (spread, fixed) = match vals.split_last() {
+                Some((Value::List(xs), fixed)) if !fixed.is_empty() => (xs.clone(), fixed.to_vec()),
+                Some((_, fixed)) if !fixed.is_empty() => return Err("apply: last argument must be a list".into()),
+                _ => return Err("apply: expected a procedure and a list".into()),
+            };
+            f = fixed[0].clone();
+            vals = fixed[1..].iter().cloned().chain(spread).collect();
+        }
         match f {
             Value::Builtin(_, func) => return func(&vals),
             Value::Lambda(l) => {
-                if l.params.len() != vals.len() {
-                    return Err(format!("expected {} args, got {}", l.params.len(), vals.len()));
-                }
-                let new = Env::new(Some(l.env.clone()));
-                for (p, v) in l.params.iter().zip(vals) { new.define(p, v); }
-                for e in &l.body[..l.body.len() - 1] { eval(e, &new)?; }
-                expr = l.body[l.body.len() - 1].clone();
+                let new = l.bind(vals)?;
+                expr = body_tail(&l.body, &new)?;
                 env = new;
             }
             other => return Err(format!("not a procedure: {other}")),

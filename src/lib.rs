@@ -5,10 +5,14 @@ pub mod parser;
 
 pub use eval::{Env, Value};
 
-/// A global environment preloaded with the builtins.
+/// Library procedures written in lispy itself (map, filter, fold, ...).
+pub const PRELUDE: &str = include_str!("prelude.scm");
+
+/// A global environment preloaded with the builtins and the prelude.
 pub fn global_env() -> Env {
     let env = Env::new(None);
     builtins::install(&env);
+    run(PRELUDE, &env).expect("prelude must evaluate cleanly");
     env
 }
 

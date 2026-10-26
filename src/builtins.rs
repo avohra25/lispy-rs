@@ -99,6 +99,49 @@ fn display(a: &[Value]) -> Result<Value, String> {
     Ok(Value::Bool(true))
 }
 
+fn reverse(a: &[Value]) -> Result<Value, String> {
+    let mut xs = as_list("reverse", a.first())?.to_vec();
+    xs.reverse();
+    Ok(Value::List(xs))
+}
+
+fn append(a: &[Value]) -> Result<Value, String> {
+    let mut out = Vec::new();
+    for v in a { out.extend_from_slice(as_list("append", Some(v))?); }
+    Ok(Value::List(out))
+}
+
+fn index(name: &str, v: Option<&Value>) -> Result<usize, String> {
+    match v {
+        Some(Value::Num(n)) if *n >= 0.0 && n.fract() == 0.0 => Ok(*n as usize),
+        other => Err(format!("{name}: expected a non-negative integer, got {}",
+            other.map(|v| v.to_string()).unwrap_or_default())),
+    }
+}
+
+fn list_ref(a: &[Value]) -> Result<Value, String> {
+    let xs = as_list("list-ref", a.first())?;
+    let k = index("list-ref", a.get(1))?;
+    xs.get(k).cloned().ok_or(format!("list-ref: index {k} out of range for length {}", xs.len()))
+}
+
+/// (iota n [start [step]]) => n numbers counting from start (default 0) by step (default 1).
+fn iota(a: &[Value]) -> Result<Value, String> {
+    let n = index("iota", a.first())?;
+    let rest = nums(&a[1.min(a.len())..])?;
+    let (start, step) = (rest.first().copied().unwrap_or(0.0), rest.get(1).copied().unwrap_or(1.0));
+    Ok(Value::List((0..n).map(|i| Value::Num(start + step * i as f64)).collect()))
+}
+
+fn apply_placeholder(_: &[Value]) -> Result<Value, String> {
+    // The evaluator intercepts calls to `apply` before reaching this.
+    Err("apply: internal error".into())
+}
+
+fn is_procedure(a: &[Value]) -> Result<Value, String> {
+    Ok(Value::Bool(matches!(a.first(), Some(Value::Builtin(..) | Value::Lambda(_)))))
+}
+
 pub fn install(env: &Env) {
     let table: &[(&'static str, crate::eval::Builtin)] = &[
         ("+", add), ("-", sub), ("*", mul), ("/", div),
@@ -106,6 +149,8 @@ pub fn install(env: &Env) {
         ("equal?", equal), ("not", not),
         ("list", list), ("car", car), ("cdr", cdr), ("cons", cons),
         ("null?", is_null), ("length", length), ("display", display),
+        ("apply", apply_placeholder), ("reverse", reverse), ("append", append),
+        ("list-ref", list_ref), ("iota", iota), ("procedure?", is_procedure),
     ];
     for (name, f) in table {
         env.define(name, Value::Builtin(name, *f));
