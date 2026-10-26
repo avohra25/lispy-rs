@@ -111,6 +111,28 @@ fn sym(e: &Expr) -> Result<String, String> {
     }
 }
 
+/// Parse a `((name init) ...)` binding list.
+fn bindings(form: &str, e: &Expr) -> Result<Vec<(String, Expr)>, String> {
+    let bs = match e {
+        Expr::List(bs) => bs,
+        other => return Err(format!("{form}: bad bindings {other}")),
+    };
+    bs.iter()
+        .map(|b| match b {
+            Expr::List(kv) if kv.len() == 2 => Ok((sym(&kv[0])?, kv[1].clone())),
+            other => Err(format!("{form}: bad binding {other}")),
+        })
+        .collect()
+}
+
+/// Evaluate all but the last expression of a body for effect and return the
+/// last one, so the caller can continue with it as a tail call.
+fn body_tail(body: &[Expr], env: &Env) -> Result<Expr, String> {
+    let (last, init) = body.split_last().ok_or("empty body")?;
+    for e in init { eval(e, env)?; }
+    Ok(last.clone())
+}
+
 fn arity(form: &str, args: &[Expr], n: usize) -> Result<(), String> {
     if args.len() < n {
         return Err(format!("{form}: expected at least {n} arguments"));
@@ -179,22 +201,71 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, String> {
                     let l = Lambda { params, body: args[1..].to_vec(), env: env.clone() };
                     return Ok(Value::Lambda(Rc::new(l)));
                 }
-                "let" => {
-                    arity("let", args, 2)?;
-                    let bindings = match &args[0] {
-                        Expr::List(bs) => bs.clone(),
-                        other => return Err(format!("let: bad bindings {other}")),
-                    };
+                "let" if matches!(args.first(), Some(Expr::Sym(_))) => {
+                    // Named let: (let loop ((i 0)) body...) binds `loop` to a
+                    // procedure over the binding names, then calls it. Calls to
+                    // `loop` in tail position reuse the evaluator loop.
+                    arity("let", args, 3)?;
+                    let name = sym(&args[0])?;
+                    let pairs = bindings("let", &args[1])?;
+                    let mut vals = Vec::with_capacity(pairs.len());
+                    for (_, init) in &pairs { vals.push(eval(init, &env)?); }
+                    let scope = Env::new(Some(env.clone()));
+                    let params = pairs.into_iter().map(|(k, _)| k).collect();
+                    let l = Rc::new(Lambda { params, body: args[2..].to_vec(), env: scope.clone() });
+                    scope.define(&name, Value::Lambda(l.clone()));
+                    let new = Env::new(Some(scope));
+                    for (p, v) in l.params.iter().zip(vals) { new.define(p, v); }
+                    expr = body_tail(&l.body, &new)?;
+                    env = new;
+                    continue;
+                }
+                "let" | "let*" => {
+                    // `let` evaluates every init in the outer scope; `let*`
+                    // evaluates each one in a scope that sees the earlier names.
+                    arity(s, args, 2)?;
+                    let sequential = s == "let*";
                     let new = Env::new(Some(env.clone()));
-                    for b in &bindings {
-                        match b {
-                            Expr::List(kv) if kv.len() == 2 => new.define(&sym(&kv[0])?, eval(&kv[1], &env)?),
-                            other => return Err(format!("let: bad binding {other}")),
-                        }
+                    for (k, init) in bindings(s, &args[0])? {
+                        let v = eval(&init, if sequential { &new } else { &env })?;
+                        new.define(&k, v);
                     }
                     env = new;
-                    for e in &args[1..args.len() - 1] { eval(e, &env)?; }
-                    expr = args[args.len() - 1].clone();
+                    expr = body_tail(&args[1..], &env)?;
+                    continue;
+                }
+                "cond" => {
+                    // (cond (test body...) ... (else body...)). A clause with no
+                    // body yields the test value. The chosen body is a tail position.
+                    let mut chosen = None;
+                    for (i, clause) in args.iter().enumerate() {
+                        let parts = match clause {
+                            Expr::List(ps) if !ps.is_empty() => ps,
+                            other => return Err(format!("cond: bad clause {other}")),
+                        };
+                        if matches!(&parts[0], Expr::Sym(e) if e == "else") {
+                            if i != args.len() - 1 { return Err("cond: else must be the last clause".into()); }
+                            chosen = Some(Err(parts[1..].to_vec()));
+                            break;
+                        }
+                        let test = eval(&parts[0], &env)?;
+                        if test.truthy() {
+                            chosen = Some(if parts.len() == 1 { Ok(test) } else { Err(parts[1..].to_vec()) });
+                            break;
+                        }
+                    }
+                    match chosen {
+                        None => return Ok(Value::Bool(false)),
+                        Some(Ok(v)) => return Ok(v),
+                        Some(Err(body)) if body.is_empty() => return Ok(Value::Bool(false)),
+                        Some(Err(body)) => { expr = body_tail(&body, &env)?; continue; }
+                    }
+                }
+                "when" | "unless" => {
+                    arity(s, args, 2)?;
+                    let t = eval(&args[0], &env)?.truthy();
+                    if t != (s == "when") { return Ok(Value::Bool(false)); }
+                    expr = body_tail(&args[1..], &env)?;
                     continue;
                 }
                 "begin" => {

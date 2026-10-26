@@ -34,3 +34,35 @@ fn errors_are_reported() {
     assert!(ev("(undefined-fn 1)").contains("unbound"));
     assert!(ev("(1 2)").contains("not a procedure"));
 }
+
+#[test]
+fn cond_when_unless() {
+    let classify = "(define (sign n) (cond ((< n 0) 'neg) ((= n 0) 'zero) (else 'pos)))";
+    assert_eq!(ev(&format!("{classify} (list (sign -3) (sign 0) (sign 7))")), "(neg zero pos)");
+    assert_eq!(ev("(cond (#f 1) (42))"), "42");
+    assert_eq!(ev("(cond (#f 1))"), "#f");
+    assert!(ev("(cond (else 1) (#t 2))").contains("else must be the last"));
+    assert_eq!(ev("(define x 0) (when (> 3 2) (set! x 5) (+ x 1))"), "6");
+    assert_eq!(ev("(unless (> 3 2) 'never)"), "#f");
+    assert_eq!(ev("(unless #f 'ran)"), "ran");
+}
+
+#[test]
+fn let_star_sees_earlier_bindings() {
+    assert_eq!(ev("(let* ((x 2) (y (* x 10))) (+ x y))"), "22");
+    // plain let evaluates inits in the outer scope
+    assert_eq!(ev("(define x 1) (let ((x 2) (y x)) y)"), "1");
+    assert!(ev("(let ((x)) x)").contains("bad binding"));
+}
+
+#[test]
+fn named_let_loops_in_constant_stack() {
+    assert_eq!(ev("(let loop ((i 0) (acc 0)) (if (= i 100000) acc (loop (+ i 1) (+ acc i))))"), "4999950000");
+    assert_eq!(ev("(let fact ((n 5)) (if (< n 2) 1 (* n (fact (- n 1)))))"), "120");
+}
+
+#[test]
+fn cond_tail_position_does_not_overflow() {
+    let src = "(define (count n) (cond ((= n 0) 'done) (else (count (- n 1))))) (count 100000)";
+    assert_eq!(ev(src), "done");
+}
